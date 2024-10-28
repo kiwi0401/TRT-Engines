@@ -1,0 +1,120 @@
+# SETUP MACHINE
+
+sudo apt-mark unhold nvidia* libnvidia*
+sudo apt install nvidia-driver-555
+
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-ubuntu2204.pin
+sudo mv cuda-ubuntu2204.pin /etc/apt/preferences.d/cuda-repository-pin-600
+wget https://developer.download.nvidia.com/compute/cuda/12.6.2/local_installers/cuda-repo-ubuntu2204-12-6-local_12.6.2-560.35.03-1_amd64.deb
+sudo dpkg -i cuda-repo-ubuntu2204-12-6-local_12.6.2-560.35.03-1_amd64.deb
+sudo cp /var/cuda-repo-ubuntu2204-12-6-local/cuda-*-keyring.gpg /usr/share/keyrings/
+sudo apt-get update
+sudo apt-get -y install cuda-toolkit-12-6
+sudo apt-get install -y nvidia-open
+sudo apt install -y nvidia-cuda-toolkit
+sudo apt update
+sudo apt upgrade
+
+sudo reboot
+
+# start trtllm and triton
+docker run --gpus all -it --rm -p 8001:8001 -p 8000:8000 -p 8002:8002 nvcr.io/nvidia/tritonserver:24.09-trtllm-python-py3
+
+export HF_API_TOKEN=
+export MODEL_NAME=Meta-Llama-3.1-8B-Instruct-FP8
+
+apt-get update && apt-get -y install python3.10 python3-pip openmpi-bin libopenmpi-dev git git-lfs
+pip3 install huggingface-hub
+pip3 install tensorrt_llm==0.13.0 -U --pre --extra-index-url https://pypi.nvidia.com
+
+git clone -b v0.13.0 https://github.com/NVIDIA/TensorRT-LLM.git
+python3 -c "import tensorrt_llm"
+
+git config --global credential.helper store
+huggingface-cli login --token $HF_API_TOKEN --add-to-git-credential
+
+git lfs install
+huggingface-cli download --local-dir ./$MODEL_NAME neuralmagic/$MODEL_NAME
+
+python3 TensorRT-LLM/examples/llama/convert_checkpoint.py --model_dir ./$MODEL_NAME --output_dir=./cpkt-$MODEL_NAME --tp_size=1 --dtype float16
+
+trtllm-build --checkpoint_dir ./cpkt-$MODEL_NAME --output_dir ./engine --gpt_attention_plugin float16 --remove_input_padding enable --kv_cache_type paged --gemm_plugin float16
+
+python3 ./TensorRT-LLM/examples/run.py --engine_dir ./engine --max_output_len 100 --tokenizer_dir ./$MODEL_NAME --input_text "How do I count to nine in French?"
+
+git clone -b v0.13.0 https://github.com/triton-inference-server/tensorrtllm_backend.git
+cd tensorrtllm_backend
+git submodule update --init --recursive
+git lfs install
+git lfs pull
+cd ..
+
+mkdir model
+cp -r ./tensorrtllm_backend/all_models/inflight_batcher_llm/* ./model
+
+export ENGINE_DIR=./engine
+export TOKENIZER_DIR=./$MODEL_NAME
+export MODEL_FOLDER=../../workspace/model
+export TRITON_MAX_BATCH_SIZE=4
+export INSTANCE_COUNT=1
+export MAX_QUEUE_DELAY_MS=0
+export MAX_QUEUE_SIZE=0
+export FILL_TEMPLATE_SCRIPT=./tensorrtllm_backend/tools/fill_template.py
+export DECOUPLED_MODE=False  # Updated to match the docs
+
+# Adjusted commands below
+
+# Ensemble configuration (same as docs)
+python3 ${FILL_TEMPLATE_SCRIPT} -i ${MODEL_FOLDER}/ensemble/config.pbtxt triton_max_batch_size:${TRITON_MAX_BATCH_SIZE}
+
+# Preprocessing configuration (same as docs)
+python3 ${FILL_TEMPLATE_SCRIPT} -i ${MODEL_FOLDER}/preprocessing/config.pbtxt tokenizer_dir:${TOKENIZER_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},preprocessing_instance_count:${INSTANCE_COUNT}
+
+# TensorRT LLM configuration (same as docs, with additional parameters)
+python3 ${FILL_TEMPLATE_SCRIPT} -i ${MODEL_FOLDER}/tensorrt_llm/config.pbtxt triton_backend:tensorrtllm,triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},decoupled_mode:${DECOUPLED_MODE},engine_dir:${ENGINE_DIR},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MS},batching_strategy:inflight_fused_batching,max_queue_size:${MAX_QUEUE_SIZE},max_beam_width:1,max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,exclude_input_in_output:True,enable_kv_cache_reuse:False
+
+# Postprocessing configuration (same as docs)
+python3 ${FILL_TEMPLATE_SCRIPT} -i ${MODEL_FOLDER}/postprocessing/config.pbtxt tokenizer_dir:${TOKENIZER_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},postprocessing_instance_count:${INSTANCE_COUNT},max_queue_size:${MAX_QUEUE_SIZE}
+
+# TensorRT LLM BLS configuration (same as docs)
+python3 ${FILL_TEMPLATE_SCRIPT} -i ${MODEL_FOLDER}/tensorrt_llm_bls/config.pbtxt triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},decoupled_mode:${DECOUPLED_MODE},bls_instance_count:${INSTANCE_COUNT}
+
+
+python3 ./tensorrtllm_backend/scripts/launch_triton_server.py --world_size=1 --model_repo=${MODEL_FOLDER}
+
+# GET OUT OF DOCKER
+cntrl p
+cntrl q
+
+# RUNNING OPENAI API W/ TRITON
+git clone --recursive https://github.com/npuichigo/openai_trtllm.git
+sudo apt install-y cargo
+sudo apt-get install -y protobuf-compiler
+cd openai_trtllm
+nohup cargo run --release > output.log 2>&1 &
+cd ..
+
+
+14660
+localhost:3000
+
+test:
+curl -X POST http://localhost:3000/v1/completions      -H "Content-Type: application/json"      -d '{
+           "model": "tensorrt_llm_bls",
+           "prompt": "Write a short poem about the stars.",
+           "max_tokens": 50,
+           "temperature": 0.7,
+           "top_p": 0.9,
+	   "stream": true
+         }'
+
+# RUNNING BENCHMARK
+git clone https://github.com/Neehan/PoIW.git
+pip3 install -U "huggingface_hub[cli]"
+export export HF_API_TOKEN=
+git config --global credential.helper store
+huggingface-cli login --token $HF_API_TOKEN --add-to-git-credential
+wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
+pip3 install vllm
+python3 -m --model Meta-Llama-3-8B-Instruct --request-rate 32 --num-prompts 1000
+python3 -m vllm_server.server_benchmark --model neuralmagic/Meta-Llama-3-8B-Instruct --request-rate 32 --num-prompts 1000 --port 3000

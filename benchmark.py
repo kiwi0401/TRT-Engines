@@ -7,142 +7,82 @@ import random
 import time
 from typing import List, Optional, Tuple
 
-import torch
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+import numpy as np
 from tqdm import tqdm
 
 def sample_requests(
         dataset_path: str,
         num_requests: int,
-        tokenizer: PreTrainedTokenizerBase,
         fixed_output_len: Optional[int],
-) -> List[Tuple[str, int, int]]:
+) -> List[str]:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
 
     # Load the dataset.
     with open(dataset_path) as f:
         dataset = json.load(f)
-    # Filter out the conversations with at least 2 turns.
-    dataset = [data for data in dataset if len(data["conversations"]) >= 2]
-    # Only keep the first two turns of each conversation.
-    dataset = [
-        (data["conversations"][0]["value"], data["conversations"][1]["value"])
-        for data in dataset
-    ]
+    # Filter out the conversations with at least 1 turn.
+    dataset = [data for data in dataset if len(data["conversations"]) >= 1]
+    # Only keep the first turn of each conversation.
+    dataset = [data["conversations"][0]["value"] for data in dataset]
 
     # Shuffle the dataset.
     random.shuffle(dataset)
 
     # Filter out sequences that are too long or too short
-    filtered_dataset: List[Tuple[str, int, int]] = []
+    filtered_dataset: List[str] = []
     for i in range(len(dataset)):
         if len(filtered_dataset) == num_requests:
             break
 
-        # Tokenize the prompts and completions.
-        prompt = dataset[i][0]
-        prompt_token_ids = tokenizer(prompt).input_ids
-        completion = dataset[i][1]
-        completion_token_ids = tokenizer(completion).input_ids
-        prompt_len = len(prompt_token_ids)
-        output_len = (
-            len(completion_token_ids) if fixed_output_len is None else fixed_output_len
-        )
-        if prompt_len < 4 or output_len < 4:
+        prompt = dataset[i]
+        if len(prompt) < 4:
             # Prune too short sequences.
             continue
-        if prompt_len > 1024 or prompt_len + output_len > 2048:
-            # Prune too long sequences.
-            continue
-        filtered_dataset.append((prompt, prompt_len, output_len))
+        filtered_dataset.append(prompt)
 
     return filtered_dataset
 
 
-def run_trtllm(requests, engine_dir, batch_size, max_output_len):
-    import tensorrt_llm
-    from tensorrt_llm.bindings.executor import Executor, Request, SamplingConfig
-    from tensorrt_llm.bindings.executor import ModelType, ExecutorConfig
-
-    # Load the engine
-    engine_path = os.path.join(engine_dir, "engine.trt")
-    if not os.path.exists(engine_path):
-        print(f"Engine file not found at {engine_path}")
-        raise FileNotFoundError(f"Engine file not found at {engine_path}")
-
-    # Load the tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(engine_dir)
-
-    # Create executor and load model to GPU
-    executor = Executor(model_path=engine_path, model_type=ModelType.DECODER_ONLY,
-                        executor_config=ExecutorConfig())
-    print("Executor initialized.")
-
-    prompts = [prompt for prompt, _, _ in requests]
-    start = time.perf_counter()
-
-    total_responses = 0
-    num_batches = (len(prompts) + batch_size - 1) // batch_size
-    for batch_idx in range(num_batches):
-        batch_prompts = prompts[batch_idx * batch_size: (batch_idx + 1) * batch_size]
-        requests_list = []
-        for prompt in batch_prompts:
-            input_ids = tokenizer(prompt, return_tensors='pt').input_ids[0].tolist()
-            sampling_config = SamplingConfig()
-            request = Request(input_token_ids=input_ids, streaming=False, sampling_config=sampling_config,
-                              max_new_tokens=max_output_len)
-            requests_list.append(request)
-
-        print(f"Processing batch {batch_idx + 1}/{num_batches}")
-        executor.enqueue_requests(requests_list)
-
-        # Wait for responses
-        responses_received = 0
-        total_requests = len(requests_list)
-        while responses_received < total_requests:
-            responses = executor.get_responses()
-            for response in responses:
-                if response.has_error():
-                    print(f"Error in response {response.request_id}: {response.error_msg}")
-                else:
-                    output_text = tokenizer.decode(response.output_token_ids, skip_special_tokens=True)
-                    print(f"Response {response.request_id}: {output_text}")
-                responses_received += 1
-                total_responses += 1
-
-    end = time.perf_counter()
-
-    executor.shutdown()
-
-    print("Inference completed.")
-
-    return end - start
-
-
-def run_triton(requests, server_url, model_name, tokenizer, batch_size, max_output_len):
+def run_triton(requests, server_url, model_name, batch_size, max_output_len):
     import tritonclient.grpc as grpcclient
-    import numpy as np
-
-    # Ensure the tokenizer has a pad_token
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
 
     # Create a Triton gRPC client
     triton_client = grpcclient.InferenceServerClient(url=server_url)
 
     # Verify server is live
     if not triton_client.is_server_live():
-        print("Failed to connect to Triton server at", server_url)
+        print(f"Failed to connect to Triton server at {server_url}")
         exit(1)
 
     # Retrieve model metadata to get input and output names
-    metadata = triton_client.get_model_metadata(model_name=model_name)
-    input_name = metadata.inputs[0].name
-    output_name = metadata.outputs[0].name
+    try:
+        metadata = triton_client.get_model_metadata(model_name=model_name)
+    except Exception as e:
+        print(f"Could not retrieve model metadata: {e}")
+        exit(1)
+
+    # Get required inputs and outputs
+    input_names = [inp.name for inp in metadata.inputs]
+    output_names = [out.name for out in metadata.outputs]
+
+    # Required inputs for the ensemble model
+    required_inputs = ['text_input', 'max_tokens']
+
+    # Check if required inputs are available
+    for req_input in required_inputs:
+        if req_input not in input_names:
+            print(f"Required input '{req_input}' not found in model inputs.")
+            exit(1)
+
+    # Output we will process
+    desired_output = 'text_output'
+    if desired_output not in output_names:
+        print(f"Desired output '{desired_output}' not found in model outputs.")
+        exit(1)
 
     # Prepare requests
-    prompts = [prompt for prompt, _, _ in requests]
+    prompts = requests
     total_responses = 0
 
     num_batches = (len(prompts) + batch_size - 1) // batch_size
@@ -150,40 +90,31 @@ def run_triton(requests, server_url, model_name, tokenizer, batch_size, max_outp
     for batch_idx in range(num_batches):
         batch_prompts = prompts[batch_idx * batch_size: (batch_idx + 1) * batch_size]
 
-        # Tokenize inputs
-        input_ids_list = []
-        max_length = 0
-        for prompt in batch_prompts:
-            input_ids = tokenizer(prompt, return_tensors='np').input_ids[0]
-            input_ids_list.append(input_ids)
-            max_length = max(max_length, len(input_ids))
+        # Prepare 'text_input' input
+        text_input = np.array(batch_prompts, dtype=object).reshape(-1, 1)
 
-        # Pad inputs
-        input_ids_padded = []
-        for input_ids in input_ids_list:
-            pad_length = max_length - len(input_ids)
-            input_ids_padded.append(
-                np.pad(input_ids, (0, pad_length), mode='constant', constant_values=tokenizer.pad_token_id)
-            )
-
-        # Convert to NumPy array
-        input_ids_np = np.array(input_ids_padded, dtype=np.int64)
+        # Prepare 'max_tokens' input
+        max_tokens = np.full((len(batch_prompts), 1), max_output_len, dtype=np.int32)
 
         # Create Triton inputs
-        inputs = [
-            grpcclient.InferInput(input_name, input_ids_np.shape, "INT64"),
-        ]
-        inputs[0].set_data_from_numpy(input_ids_np)
+        inputs = []
+
+        # text_input
+        input_text = grpcclient.InferInput('text_input', text_input.shape, "BYTES")
+        input_text.set_data_from_numpy(text_input)
+        inputs.append(input_text)
+
+        # max_tokens
+        input_max_tokens = grpcclient.InferInput('max_tokens', max_tokens.shape, "INT32")
+        input_max_tokens.set_data_from_numpy(max_tokens)
+        inputs.append(input_max_tokens)
+
+        # Optional inputs can be added here if needed
 
         # Create Triton outputs
         outputs = [
-            grpcclient.InferRequestedOutput(output_name),
+            grpcclient.InferRequestedOutput('text_output'),
         ]
-
-        # Set parameters (if needed)
-        parameters = {
-            'max_output_len': max_output_len,
-        }
 
         # Send request to Triton
         results = triton_client.infer(
@@ -192,15 +123,14 @@ def run_triton(requests, server_url, model_name, tokenizer, batch_size, max_outp
             outputs=outputs,
             model_version="",
             request_id="",
-            parameters=parameters,
+            parameters={},
             timeout=None,
         )
 
         # Process the outputs
-        output_data = results.as_numpy(output_name)
+        output_data = results.as_numpy('text_output')
         for i in range(len(batch_prompts)):
-            output_ids = output_data[i]
-            output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
+            output_text = output_data[i][0].decode('utf-8')
             print(f"Response {total_responses + i}: {output_text}")
 
         total_responses += len(batch_prompts)
@@ -238,47 +168,44 @@ def main():
         if not args.engine_dir:
             raise ValueError("engine-dir must be specified for TensorRT backend.")
         tokenizer_dir = args.engine_dir
+        # Load the tokenizer
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
     elif args.backend == "triton":
         if not args.model_name:
             raise ValueError("model-name must be specified for Triton backend.")
-        if not args.tokenizer_dir:
-            raise ValueError("tokenizer-dir must be specified for Triton backend.")
-        tokenizer_dir = args.tokenizer_dir
+        # For the ensemble model, tokenizer is not needed in the client
+        tokenizer = None
     else:
         raise ValueError("Invalid backend specified.")
 
     # Sample the requests.
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
     if args.dataset is None:
         # Synthesize a prompt with the given input length.
         if args.input_len is None or args.output_len is None:
             raise ValueError("input-len and output-len must be specified when dataset is not provided.")
         prompt = "hi" * (args.input_len - 1)
-        requests = [
-            (prompt, args.input_len, args.output_len) for _ in range(args.num_prompts)
-        ]
+        requests = [prompt for _ in range(args.num_prompts)]
     else:
         requests = sample_requests(
-            args.dataset, args.num_prompts, tokenizer, args.output_len
+            args.dataset, args.num_prompts, args.output_len
         )
 
-    if args.backend == "tensorrt":
-        elapsed_time = run_trtllm(
-            requests, args.engine_dir, args.batch_size, args.max_output_len
-        )
-    elif args.backend == "triton":
+    # if args.backend == "tensorrt":
+    #     elapsed_time = run_trtllm(
+    #         requests, args.engine_dir, args.batch_size, args.max_output_len
+    #     )
+    if args.backend == "triton":
         elapsed_time = run_triton(
-            requests, args.server_url, args.model_name, tokenizer, args.batch_size, args.max_output_len
+            requests, args.server_url, args.model_name, args.batch_size, args.max_output_len
         )
     else:
         raise ValueError("Invalid backend specified.")
 
-    total_num_tokens = sum(
-        prompt_len + output_len for _, prompt_len, output_len in requests
-    )
+    total_num_tokens = sum(len(prompt) for prompt in requests)
     print(
         f"Throughput: {len(requests) / elapsed_time:.2f} requests/s, "
-        f"{total_num_tokens / elapsed_time:.2f} tokens/s"
+        f"{total_num_tokens / elapsed_time:.2f} chars/s"
     )
 
 

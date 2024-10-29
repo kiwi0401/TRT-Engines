@@ -9,15 +9,14 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 from tqdm import tqdm
+import tritonclient.grpc as grpcclient
+from tritonclient.utils import InferenceServerException
+
 
 def sample_requests(
         dataset_path: str,
         num_requests: int,
-        fixed_output_len: Optional[int],
 ) -> List[str]:
-    if fixed_output_len is not None and fixed_output_len < 4:
-        raise ValueError("output_len too small")
-
     # Load the dataset.
     with open(dataset_path) as f:
         dataset = json.load(f)
@@ -36,8 +35,8 @@ def sample_requests(
             break
 
         prompt = dataset[i]
-        if len(prompt) < 4:
-            # Prune too short sequences.
+        if len(prompt.strip()) == 0:
+            # Skip empty prompts
             continue
         filtered_dataset.append(prompt)
 
@@ -58,7 +57,7 @@ def run_triton(requests, server_url, model_name, batch_size, max_output_len):
     # Retrieve model metadata to get input and output names
     try:
         metadata = triton_client.get_model_metadata(model_name=model_name)
-    except Exception as e:
+    except InferenceServerException as e:
         print(f"Could not retrieve model metadata: {e}")
         exit(1)
 
@@ -110,30 +109,31 @@ def run_triton(requests, server_url, model_name, batch_size, max_output_len):
         inputs.append(input_max_tokens)
 
         # Optional inputs can be added here if needed
+        # For example, set 'temperature' to 1.0
+        temperature = np.full((len(batch_prompts), 1), 1.0, dtype=np.float32)
+        input_temperature = grpcclient.InferInput('temperature', temperature.shape, "FP32")
+        input_temperature.set_data_from_numpy(temperature)
+        inputs.append(input_temperature)
 
         # Create Triton outputs
         outputs = [
             grpcclient.InferRequestedOutput('text_output'),
         ]
 
-        print("SENDING INFERENCE REQUEST")
-
         # Send request to Triton
-        results = triton_client.infer(
-            model_name=model_name,
-            inputs=inputs,
-            outputs=outputs,
-            model_version="",
-            request_id="",
-            parameters={},
-            timeout=None,
-        )
-
-        print("SENT INFERENCE REQUEST")
+        try:
+            results = triton_client.infer(
+                model_name=model_name,
+                inputs=inputs,
+                outputs=outputs,
+                parameters={},
+            )
+        except InferenceServerException as e:
+            print(f"Inference failed: {e}")
+            continue
 
         # Process the outputs
         output_data = results.as_numpy('text_output')
-        print("OUTPUT RECIEVED")
         for i in range(len(batch_prompts)):
             output_text = output_data[i][0].decode('utf-8')
             print(f"Response {total_responses + i}: {output_text}")
@@ -162,7 +162,6 @@ def main():
     # Arguments for Triton
     parser.add_argument("--server-url", type=str, default='localhost:8001', help="URL of the Triton server.")
     parser.add_argument("--model-name", type=str, help="Name of the model on Triton server.")
-    parser.add_argument("--tokenizer-dir", type=str, help="Directory of the tokenizer.")
 
     args = parser.parse_args()
 
@@ -187,13 +186,13 @@ def main():
     # Sample the requests.
     if args.dataset is None:
         # Synthesize a prompt with the given input length.
-        if args.input_len is None or args.output_len is None:
-            raise ValueError("input-len and output-len must be specified when dataset is not provided.")
-        prompt = "hi" * (args.input_len - 1)
+        if args.input_len is None:
+            raise ValueError("input-len must be specified when dataset is not provided.")
+        prompt = "hi" * (args.input_len)
         requests = [prompt for _ in range(args.num_prompts)]
     else:
         requests = sample_requests(
-            args.dataset, args.num_prompts, args.output_len
+            args.dataset, args.num_prompts
         )
 
     # if args.backend == "tensorrt":
@@ -207,10 +206,10 @@ def main():
     else:
         raise ValueError("Invalid backend specified.")
 
-    total_num_tokens = sum(len(prompt) for prompt in requests)
+    total_num_chars = sum(len(prompt) for prompt in requests)
     print(
         f"Throughput: {len(requests) / elapsed_time:.2f} requests/s, "
-        f"{total_num_tokens / elapsed_time:.2f} chars/s"
+        f"{total_num_chars / elapsed_time:.2f} chars/s"
     )
 
 

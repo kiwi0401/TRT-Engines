@@ -1,14 +1,14 @@
-"""Benchmark offline inference throughput using TensorRT-LLM or Triton Inference Server."""
+"""Benchmark offline inference throughput using Triton Inference Server."""
 
 import argparse
 import json
 import os
 import random
+import sys
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
-from tqdm import tqdm
 import tritonclient.grpc as grpcclient
 from tritonclient.utils import InferenceServerException
 
@@ -43,23 +43,32 @@ def sample_requests(
     return filtered_dataset
 
 
-def run_triton(requests, server_url, model_name, batch_size, max_output_len):
+def run_triton(requests, server_url, model_name, batch_size, max_output_len, verbose):
     import tritonclient.grpc as grpcclient
 
-    # Create a Triton gRPC client
-    triton_client = grpcclient.InferenceServerClient(url=server_url)
+    try:
+        triton_client = grpcclient.InferenceServerClient(
+            url=server_url, verbose=verbose
+        )
+    except Exception as e:
+        print("channel creation failed: " + str(e))
+        sys.exit()
 
-    # Verify server is live
+    # Verify server is live and model is ready
     if not triton_client.is_server_live():
         print(f"Failed to connect to Triton server at {server_url}")
-        exit(1)
+        sys.exit(1)
+
+    if not triton_client.is_model_ready(model_name=model_name):
+        print(f"Model {model_name} is not ready")
+        sys.exit(1)
 
     # Retrieve model metadata to get input and output names
     try:
         metadata = triton_client.get_model_metadata(model_name=model_name)
     except InferenceServerException as e:
         print(f"Could not retrieve model metadata: {e}")
-        exit(1)
+        sys.exit(1)
 
     # Get required inputs and outputs
     input_names = [inp.name for inp in metadata.inputs]
@@ -72,13 +81,13 @@ def run_triton(requests, server_url, model_name, batch_size, max_output_len):
     for req_input in required_inputs:
         if req_input not in input_names:
             print(f"Required input '{req_input}' not found in model inputs.")
-            exit(1)
+            sys.exit(1)
 
     # Output we will process
     desired_output = 'text_output'
     if desired_output not in output_names:
         print(f"Desired output '{desired_output}' not found in model outputs.")
-        exit(1)
+        sys.exit(1)
 
     # Prepare requests
     prompts = requests
@@ -95,38 +104,36 @@ def run_triton(requests, server_url, model_name, batch_size, max_output_len):
         # Prepare 'max_tokens' input
         max_tokens = np.full((len(batch_prompts), 1), max_output_len, dtype=np.int32)
 
-        # Create Triton inputs
-        inputs = []
+        # Create the data for optional inputs (e.g., temperature)
+        temperature = np.full((len(batch_prompts), 1), 1.0, dtype=np.float32)
 
-        # text_input
+        # Initialize inputs
+        inputs = []
         input_text = grpcclient.InferInput('text_input', text_input.shape, "BYTES")
         input_text.set_data_from_numpy(text_input)
-        inputs.append(input_text)
 
-        # max_tokens
         input_max_tokens = grpcclient.InferInput('max_tokens', max_tokens.shape, "INT32")
         input_max_tokens.set_data_from_numpy(max_tokens)
-        inputs.append(input_max_tokens)
 
-        # Optional inputs can be added here if needed
-        # For example, set 'temperature' to 1.0
-        temperature = np.full((len(batch_prompts), 1), 1.0, dtype=np.float32)
         input_temperature = grpcclient.InferInput('temperature', temperature.shape, "FP32")
         input_temperature.set_data_from_numpy(temperature)
+
+        # Append inputs
+        inputs.append(input_text)
+        inputs.append(input_max_tokens)
         inputs.append(input_temperature)
 
-        # Create Triton outputs
-        outputs = [
-            grpcclient.InferRequestedOutput('text_output'),
-        ]
+        # Initialize outputs
+        outputs = []
+        output_text = grpcclient.InferRequestedOutput('text_output')
+        outputs.append(output_text)
 
-        # Send request to Triton
+        # Send inference request
         try:
             results = triton_client.infer(
                 model_name=model_name,
                 inputs=inputs,
                 outputs=outputs,
-                parameters={},
             )
         except InferenceServerException as e:
             print(f"Inference failed: {e}")
@@ -147,7 +154,7 @@ def run_triton(requests, server_url, model_name, batch_size, max_output_len):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark the throughput using TensorRT-LLM or Triton Inference Server.")
+    parser = argparse.ArgumentParser(description="Benchmark the throughput using Triton Inference Server.")
     parser.add_argument("--backend", type=str, choices=["tensorrt", "triton"], required=True,
                         help="Backend to use: 'tensorrt' or 'triton'.")
     parser.add_argument("--dataset", type=str, default=None, help="Path to the dataset.")
@@ -157,8 +164,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for inference.")
     parser.add_argument("--max-output-len", type=int, default=256, help="Maximum output length.")
-    # Arguments for TensorRT-LLM
-    parser.add_argument("--engine-dir", type=str, help="Path to the TensorRT Engine directory.")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
     # Arguments for Triton
     parser.add_argument("--server-url", type=str, default='localhost:8001', help="URL of the Triton server.")
     parser.add_argument("--model-name", type=str, help="Name of the model on Triton server.")
@@ -167,25 +173,15 @@ def main():
 
     random.seed(args.seed)
 
-    # Validate arguments based on the backend
-    if args.backend == "tensorrt":
-        if not args.engine_dir:
-            raise ValueError("engine-dir must be specified for TensorRT backend.")
-        tokenizer_dir = args.engine_dir
-        # Load the tokenizer
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
-    elif args.backend == "triton":
+    if args.backend == "triton":
         if not args.model_name:
             raise ValueError("model-name must be specified for Triton backend.")
-        # For the ensemble model, tokenizer is not needed in the client
         tokenizer = None
     else:
         raise ValueError("Invalid backend specified.")
 
     # Sample the requests.
     if args.dataset is None:
-        # Synthesize a prompt with the given input length.
         if args.input_len is None:
             raise ValueError("input-len must be specified when dataset is not provided.")
         prompt = "hi" * (args.input_len)
@@ -195,13 +191,9 @@ def main():
             args.dataset, args.num_prompts
         )
 
-    # if args.backend == "tensorrt":
-    #     elapsed_time = run_trtllm(
-    #         requests, args.engine_dir, args.batch_size, args.max_output_len
-    #     )
     if args.backend == "triton":
         elapsed_time = run_triton(
-            requests, args.server_url, args.model_name, args.batch_size, args.max_output_len
+            requests, args.server_url, args.model_name, args.batch_size, args.max_output_len, args.verbose
         )
     else:
         raise ValueError("Invalid backend specified.")

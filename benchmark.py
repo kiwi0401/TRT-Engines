@@ -44,112 +44,89 @@ def sample_requests(
 
 
 def run_triton(requests, server_url, model_name, batch_size, max_output_len, verbose):
-    import tritonclient.grpc as grpcclient
-
     try:
+        # Initialize the Triton client
         triton_client = grpcclient.InferenceServerClient(
             url=server_url, verbose=verbose
         )
     except Exception as e:
-        print("channel creation failed: " + str(e))
-        sys.exit()
+        print("Client creation failed: " + str(e))
+        sys.exit(1)
 
-    # Verify server is live and model is ready
+    # Check if server and model are live and ready
     if not triton_client.is_server_live():
         print(f"Failed to connect to Triton server at {server_url}")
         sys.exit(1)
-
     if not triton_client.is_model_ready(model_name=model_name):
         print(f"Model {model_name} is not ready")
         sys.exit(1)
 
-    # Retrieve model metadata to get input and output names
+    # Set up input names and output names based on model metadata
     try:
         metadata = triton_client.get_model_metadata(model_name=model_name)
+        input_names = [input_.name for input_ in metadata.inputs]
+        output_names = [output.name for output in metadata.outputs]
     except InferenceServerException as e:
         print(f"Could not retrieve model metadata: {e}")
         sys.exit(1)
 
-    # Get required inputs and outputs
-    input_names = [inp.name for inp in metadata.inputs]
-    output_names = [out.name for out in metadata.outputs]
-
-    # Required inputs for the ensemble model
-    required_inputs = ['text_input', 'max_tokens']
-
-    # Check if required inputs are available
+    # Define required inputs and outputs based on metadata
+    required_inputs = ["text_input", "max_tokens"]
     for req_input in required_inputs:
         if req_input not in input_names:
             print(f"Required input '{req_input}' not found in model inputs.")
             sys.exit(1)
 
-    # Output we will process
-    desired_output = 'text_output'
+    desired_output = "text_output"
     if desired_output not in output_names:
         print(f"Desired output '{desired_output}' not found in model outputs.")
         sys.exit(1)
 
-    # Prepare requests
-    prompts = requests
+    # Prepare inference requests
     total_responses = 0
-
-    num_batches = (len(prompts) + batch_size - 1) // batch_size
+    num_batches = (len(requests) + batch_size - 1) // batch_size
     start = time.perf_counter()
+
     for batch_idx in range(num_batches):
-        batch_prompts = prompts[batch_idx * batch_size: (batch_idx + 1) * batch_size]
+        batch_prompts = requests[batch_idx * batch_size: (batch_idx + 1) * batch_size]
 
-        # Prepare 'text_input' input
+        # Initialize inputs with the correct data types and shapes
         text_input = np.array(batch_prompts, dtype=object).reshape(-1, 1)
-
-        # Prepare 'max_tokens' input
         max_tokens = np.full((len(batch_prompts), 1), max_output_len, dtype=np.int32)
-
-        # Create the data for optional inputs (e.g., temperature)
         temperature = np.full((len(batch_prompts), 1), 1.0, dtype=np.float32)
 
-        # Initialize inputs
-        inputs = []
-        input_text = grpcclient.InferInput('text_input', text_input.shape, "BYTES")
-        input_text.set_data_from_numpy(text_input)
+        inputs = [
+            grpcclient.InferInput("text_input", text_input.shape, "BYTES"),
+            grpcclient.InferInput("max_tokens", max_tokens.shape, "INT32"),
+            grpcclient.InferInput("temperature", temperature.shape, "FP32"),
+        ]
 
-        input_max_tokens = grpcclient.InferInput('max_tokens', max_tokens.shape, "INT32")
-        input_max_tokens.set_data_from_numpy(max_tokens)
+        # Set input data
+        inputs[0].set_data_from_numpy(text_input)
+        inputs[1].set_data_from_numpy(max_tokens)
+        inputs[2].set_data_from_numpy(temperature)
 
-        input_temperature = grpcclient.InferInput('temperature', temperature.shape, "FP32")
-        input_temperature.set_data_from_numpy(temperature)
+        # Define outputs
+        outputs = [grpcclient.InferRequestedOutput(desired_output)]
 
-        # Append inputs
-        inputs.append(input_text)
-        inputs.append(input_max_tokens)
-        inputs.append(input_temperature)
-
-        # Initialize outputs
-        outputs = []
-        output_text = grpcclient.InferRequestedOutput('text_output')
-        outputs.append(output_text)
-
-        # Send inference request
+        # Send inference request and process response
         try:
             results = triton_client.infer(
-                model_name=model_name,
-                inputs=inputs,
-                outputs=outputs,
+                model_name=model_name, inputs=inputs, outputs=outputs
             )
+            output_data = results.as_numpy(desired_output)
+
+            for i, prompt in enumerate(batch_prompts):
+                output_text = output_data[i][0].decode("utf-8")
+                print(f"Response {total_responses + i}: {output_text}")
+            total_responses += len(batch_prompts)
+
         except InferenceServerException as e:
-            print(f"Inference failed: {e}")
+            print(f"Inference failed for batch {batch_idx}: {e}")
             continue
 
-        # Process the outputs
-        output_data = results.as_numpy('text_output')
-        for i in range(len(batch_prompts)):
-            output_text = output_data[i][0].decode('utf-8')
-            print(f"Response {total_responses + i}: {output_text}")
-
-        total_responses += len(batch_prompts)
     end = time.perf_counter()
-
     print("Inference completed.")
-
     return end - start
 
 

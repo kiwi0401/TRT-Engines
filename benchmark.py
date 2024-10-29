@@ -217,7 +217,7 @@ def main():
     # Arguments for TensorRT-LLM
     parser.add_argument("--engine-dir", type=str, help="Path to the TensorRT Engine directory.")
     # Arguments for Triton
-    parser.add_argument("--server-url", type=str, default='localhost:8000', help="URL of the Triton server.")
+    parser.add_argument("--server-url", type=str, default='localhost:8001', help="URL of the Triton server.")
     parser.add_argument("--model-name", type=str, help="Name of the model on Triton server.")
     parser.add_argument("--tokenizer-dir", type=str, help="Directory of the tokenizer.")
 

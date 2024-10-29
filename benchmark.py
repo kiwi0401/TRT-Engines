@@ -131,6 +131,16 @@ def run_triton(requests, server_url, model_name, tokenizer, batch_size, max_outp
     # Create a Triton gRPC client
     triton_client = grpcclient.InferenceServerClient(url=server_url)
 
+    # Verify server is live
+    if not triton_client.is_server_live():
+        print("Failed to connect to Triton server at", server_url)
+        exit(1)
+
+    # Retrieve model metadata to get input and output names
+    metadata = triton_client.get_model_metadata(model_name=model_name)
+    input_name = metadata.inputs[0].name
+    output_name = metadata.outputs[0].name
+
     # Prepare requests
     prompts = [prompt for prompt, _, _ in requests]
     total_responses = 0
@@ -161,13 +171,13 @@ def run_triton(requests, server_url, model_name, tokenizer, batch_size, max_outp
 
         # Create Triton inputs
         inputs = [
-            grpcclient.InferInput('input_ids', input_ids_np.shape, "INT64"),
+            grpcclient.InferInput(input_name, input_ids_np.shape, "INT64"),
         ]
         inputs[0].set_data_from_numpy(input_ids_np)
 
         # Create Triton outputs
         outputs = [
-            grpcclient.InferRequestedOutput('output_ids'),
+            grpcclient.InferRequestedOutput(output_name),
         ]
 
         # Set parameters (if needed)
@@ -187,7 +197,7 @@ def run_triton(requests, server_url, model_name, tokenizer, batch_size, max_outp
         )
 
         # Process the outputs
-        output_data = results.as_numpy('output_ids')
+        output_data = results.as_numpy(output_name)
         for i in range(len(batch_prompts)):
             output_ids = output_data[i]
             output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
@@ -199,8 +209,6 @@ def run_triton(requests, server_url, model_name, tokenizer, batch_size, max_outp
     print("Inference completed.")
 
     return end - start
-
-
 
 
 def main():

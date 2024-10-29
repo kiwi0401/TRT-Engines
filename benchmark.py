@@ -124,6 +124,10 @@ def run_triton(requests, server_url, model_name, tokenizer, batch_size, max_outp
     import tritonclient.grpc as grpcclient
     import numpy as np
 
+    # Ensure the tokenizer has a pad_token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     # Create a Triton gRPC client
     triton_client = grpcclient.InferenceServerClient(url=server_url)
 
@@ -195,6 +199,7 @@ def run_triton(requests, server_url, model_name, tokenizer, batch_size, max_outp
     print("Inference completed.")
 
     return end - start
+
 
 
 

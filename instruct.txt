@@ -90,28 +90,6 @@ python3 ./tensorrtllm_backend/scripts/launch_triton_server.py --world_size=1 --m
 cntrl p
 cntrl q
 
-# RUNNING OPENAI API W/ TRITON
-git clone --recursive https://github.com/npuichigo/openai_trtllm.git
-sudo apt install-y cargo
-sudo apt-get install -y protobuf-compiler
-cd openai_trtllm
-nohup cargo run --release > output.log 2>&1 &
-cd ..
-
-
-14660
-localhost:3000
-
-test:
-curl -X POST http://localhost:3000/v1/completions      -H "Content-Type: application/json"      -d '{
-           "model": "tensorrt_llm_bls",
-           "prompt": "Write a short poem about the stars.",
-           "max_tokens": 50,
-           "temperature": 0.7,
-           "top_p": 0.9,
-	   "stream": true
-         }'
-
 # RUNNING BENCHMARK
 export MODEL_NAME=Meta-Llama-3.1-8B-Instruct
 git clone https://github.com/kiwi0401/TRT-Engines.git

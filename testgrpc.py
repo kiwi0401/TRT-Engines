@@ -1,6 +1,6 @@
 import tritonclient.grpc as grpcclient
 
-MODEL_NAME = 'tensorrt_llm_bls'
+MODEL_NAME = 'tensorrt_llm'
 # Create Triton client
 triton_client = grpcclient.InferenceServerClient(url="localhost:8001")
 

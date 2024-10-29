@@ -63,7 +63,7 @@ def run_triton_streaming(triton_client, requests, model_name, batch_size, max_ou
 
         inputs = [
             prepare_tensor("text_input", text_input),
-            prepare_tensor("max_tokens", max_tokens),
+            # prepare_tensor("max_tokens", max_tokens),
             prepare_tensor("temperature", temperature),
         ]
 
@@ -89,10 +89,7 @@ def run_triton_streaming(triton_client, requests, model_name, batch_size, max_ou
 
         output_data = result.as_numpy("text_output")
         for i, output in enumerate(output_data):
-            decoded_output = output[0].decode("utf-8")
-            responses.append(decoded_output)
-            if verbose:
-                print(f"Response {total_responses + i}: {decoded_output}")
+            print(f"Prompt: {i} finished")
 
         total_responses += output_data.shape[0]
 

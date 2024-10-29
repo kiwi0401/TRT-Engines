@@ -117,8 +117,9 @@ def run_triton(requests, server_url, model_name, batch_size, max_output_len, ver
             output_data = results.as_numpy(desired_output)
 
             for i, prompt in enumerate(batch_prompts):
-                output_text = output_data[i][0].decode("utf-8")
-                print(f"Response {total_responses + i}: {output_text}")
+                print(output_data[i])
+                # output_text = output_data[i][0].decode("utf-8")
+                # print(f"Response {total_responses + i}: {output_text}")
             total_responses += len(batch_prompts)
 
         except InferenceServerException as e:

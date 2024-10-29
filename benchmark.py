@@ -116,6 +116,8 @@ def run_triton(requests, server_url, model_name, batch_size, max_output_len):
             grpcclient.InferRequestedOutput('text_output'),
         ]
 
+        print("SENDING INFERENCE REQUEST")
+
         # Send request to Triton
         results = triton_client.infer(
             model_name=model_name,
@@ -127,8 +129,11 @@ def run_triton(requests, server_url, model_name, batch_size, max_output_len):
             timeout=None,
         )
 
+        print("SENT INFERENCE REQUEST")
+
         # Process the outputs
         output_data = results.as_numpy('text_output')
+        print("OUTPUT RECIEVED")
         for i in range(len(batch_prompts)):
             output_text = output_data[i][0].decode('utf-8')
             print(f"Response {total_responses + i}: {output_text}")

@@ -121,11 +121,11 @@ def run_trtllm(requests, engine_dir, batch_size, max_output_len):
 
 
 def run_triton(requests, server_url, model_name, tokenizer, batch_size, max_output_len):
-    import tritonclient.http as httpclient
+    import tritonclient.grpc as grpcclient
     import numpy as np
 
-    # Create a Triton HTTP client
-    triton_client = httpclient.InferenceServerClient(url=server_url)
+    # Create a Triton gRPC client
+    triton_client = grpcclient.InferenceServerClient(url=server_url)
 
     # Prepare requests
     prompts = [prompt for prompt, _, _ in requests]
@@ -137,7 +137,6 @@ def run_triton(requests, server_url, model_name, tokenizer, batch_size, max_outp
         batch_prompts = prompts[batch_idx * batch_size: (batch_idx + 1) * batch_size]
 
         # Tokenize inputs
-        inputs = []
         input_ids_list = []
         max_length = 0
         for prompt in batch_prompts:
@@ -153,18 +152,24 @@ def run_triton(requests, server_url, model_name, tokenizer, batch_size, max_outp
                 np.pad(input_ids, (0, pad_length), mode='constant', constant_values=tokenizer.pad_token_id)
             )
 
-        # Create Triton inputs
+        # Convert to NumPy array
         input_ids_np = np.array(input_ids_padded, dtype=np.int64)
 
+        # Create Triton inputs
         inputs = [
-            httpclient.InferInput('input_ids', input_ids_np.shape, "INT64"),
+            grpcclient.InferInput('input_ids', input_ids_np.shape, "INT64"),
         ]
         inputs[0].set_data_from_numpy(input_ids_np)
 
         # Create Triton outputs
         outputs = [
-            httpclient.InferRequestedOutput('output_ids'),
+            grpcclient.InferRequestedOutput('output_ids'),
         ]
+
+        # Set parameters (if needed)
+        parameters = {
+            'max_output_len': max_output_len,
+        }
 
         # Send request to Triton
         results = triton_client.infer(
@@ -172,9 +177,8 @@ def run_triton(requests, server_url, model_name, tokenizer, batch_size, max_outp
             inputs=inputs,
             outputs=outputs,
             model_version="",
-            headers={},
             request_id="",
-            parameters={'max_output_len': max_output_len},
+            parameters=parameters,
             timeout=None,
         )
 
@@ -191,6 +195,7 @@ def run_triton(requests, server_url, model_name, tokenizer, batch_size, max_outp
     print("Inference completed.")
 
     return end - start
+
 
 
 def main():
